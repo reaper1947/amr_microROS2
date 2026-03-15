@@ -1,0 +1,35 @@
+{
+	"folders": [
+		{
+			"path": "../../.."
+		},
+		{
+			"name": "teensy_micro_ros",
+			"path": "../../teensy_micro_ros"
+		},
+		{
+			"name": "mega",
+			"path": ".."
+		}
+	],
+	"settings": {
+		"python.autoComplete.extraPaths": [
+			"/home/ter/kmutnb_project_ws/build/serial_cmdvel",
+			"/home/ter/kmutnb_project_ws/install/serial_cmdvel/lib/python3.10/site-packages",
+			"/home/ter/kmutnb_project_ws/install/queue_nav2_interfaces/local/lib/python3.10/dist-packages",
+			"/home/ter/kmutnb_project_ws/build/queue_nav2",
+			"/home/ter/kmutnb_project_ws/install/queue_nav2/lib/python3.10/site-packages",
+			"/opt/ros/humble/lib/python3.10/site-packages",
+			"/opt/ros/humble/local/lib/python3.10/dist-packages"
+		],
+		"python.analysis.extraPaths": [
+			"/home/ter/kmutnb_project_ws/build/serial_cmdvel",
+			"/home/ter/kmutnb_project_ws/install/serial_cmdvel/lib/python3.10/site-packages",
+			"/home/ter/kmutnb_project_ws/install/queue_nav2_interfaces/local/lib/python3.10/dist-packages",
+			"/home/ter/kmutnb_project_ws/build/queue_nav2",
+			"/home/ter/kmutnb_project_ws/install/queue_nav2/lib/python3.10/site-packages",
+			"/opt/ros/humble/lib/python3.10/site-packages",
+			"/opt/ros/humble/local/lib/python3.10/dist-packages"
+		]
+	}
+}

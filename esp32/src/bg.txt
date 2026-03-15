@@ -1,0 +1,172 @@
+#include <Arduino.h>
+#include <micro_ros_platformio.h>
+#include <rcl/rcl.h>
+#include <rclc/rclc.h>
+#include <rclc/executor.h>
+#include <geometry_msgs/msg/twist.h>
+#include <nav_msgs/msg/odometry.h>
+#include <std_msgs/msg/float32.h>
+#include <std_msgs/msg/int64.h>
+#include "FastAccelStepper.h"
+#include <rosidl_runtime_c/string_functions.h>
+
+// --- Pins Config ---
+#define STEP_L 26
+#define DIR_L  25
+#define STEP_R 33
+#define DIR_R  32
+#define EN_PIN 27
+
+#define ENC_L_A 14
+#define ENC_L_B 13  // ย้ายจาก 12 มา 13 เพื่อความปลอดภัยในการ Flash
+#define ENC_R_A 34
+#define ENC_R_B 35
+
+// --- Robot Parameters ---
+#define WHEEL_RADIUS 0.0075      // รัศมี 7.5 cm
+#define TRACK_WIDTH  0.059       // ระยะห่างล้อ 59 cm
+#define GEAR_RATIO    0.5      // ทดเกียร์ 1:10 (สำหรับส่งค่าให้ Stepper)
+#define STEP_MICRO   4.0
+#define ENCODER_PPR  1000.0
+#define TICKS_PER_REV_STEP (200.0 * STEP_MICRO * GEAR_RATIO)
+
+// คำนวณค่าคงที่
+const float METER_TO_STEPS = TICKS_PER_REV_STEP / (2.0 * PI * WHEEL_RADIUS);
+const float RAD_TO_STEPS   = (METER_TO_STEPS * TRACK_WIDTH / 2.0);
+
+// ระยะทางต่อ 1 Tick (จากที่คุณเช็คได้ 2000 ticks/รอบ)
+const float METER_PER_TICK = (2.0 * PI * WHEEL_RADIUS) / 2000.0;
+
+// --- Global Variables ---
+FastAccelStepperEngine engine = FastAccelStepperEngine();
+FastAccelStepper *lstepper = NULL;
+FastAccelStepper *rstepper = NULL;
+
+volatile long encoderL = 0, encoderR = 0;
+long lastEncL = 0, lastEncR = 0;
+double pose_x = 0, pose_y = 0, pose_theta = 0;
+
+// micro-ROS
+rcl_subscription_t subscriber;
+geometry_msgs__msg__Twist msg_cmd_vel;
+rcl_publisher_t odom_pub;
+nav_msgs__msg__Odometry msg_odom;
+rcl_publisher_t rpm_l_pub, rpm_r_pub, tick_l_pub, tick_r_pub;
+std_msgs__msg__Float32 msg_rpm_l, msg_rpm_r;
+std_msgs__msg__Int64 msg_tick_l, msg_tick_r;
+
+rclc_executor_t executor;
+rclc_support_t support;
+rcl_allocator_t allocator;
+rcl_node_t node;
+
+// --- ISR (Encoder) ---
+void IRAM_ATTR ISR_L() { (digitalRead(ENC_L_B)) ? encoderL++ : encoderL--; }
+void IRAM_ATTR ISR_R() { (digitalRead(ENC_R_B)) ? encoderR-- : encoderR++; }
+
+void cmd_vel_callback(const void * msgin) {
+    const geometry_msgs__msg__Twist * msg = (const geometry_msgs__msg__Twist *)msgin;
+    float vx = msg->linear.x * 2.0; // เพิ่ม Max Speed 2 เท่า
+    float wz = msg->angular.z * 2.0;
+
+    int32_t l_speed = (int32_t)(vx * METER_TO_STEPS - wz * RAD_TO_STEPS);
+    int32_t r_speed = (int32_t)(vx * METER_TO_STEPS + wz * RAD_TO_STEPS);
+
+    if (l_speed == 0) lstepper->stopMove();
+    else {
+        lstepper->setSpeedInHz(abs(l_speed));
+        (l_speed > 0) ? lstepper->runForward() : lstepper->runBackward();
+    }
+
+    if (r_speed == 0) rstepper->stopMove();
+    else {
+        rstepper->setSpeedInHz(abs(r_speed));
+        (r_speed > 0) ? rstepper->runBackward() : rstepper->runForward();
+    }
+}
+
+void setup() {
+    Serial.begin(115200);
+    set_microros_serial_transports(Serial);
+
+    pinMode(ENC_L_A, INPUT_PULLUP); pinMode(ENC_L_B, INPUT_PULLUP);
+    pinMode(ENC_R_A, INPUT_PULLUP); pinMode(ENC_R_B, INPUT_PULLUP);
+    attachInterrupt(digitalPinToInterrupt(ENC_L_A), ISR_L, CHANGE);
+    attachInterrupt(digitalPinToInterrupt(ENC_R_A), ISR_R, CHANGE);
+
+    engine.init();
+    lstepper = engine.stepperConnectToPin(STEP_L);
+    lstepper->setDirectionPin(DIR_L);
+    lstepper->setEnablePin(EN_PIN);
+    lstepper->setAutoEnable(true);
+    lstepper->setAcceleration(1000000); // พุ่งทันที
+
+    rstepper = engine.stepperConnectToPin(STEP_R);
+    rstepper->setDirectionPin(DIR_R);
+    rstepper->setEnablePin(EN_PIN);
+    rstepper->setAutoEnable(true);
+    rstepper->setAcceleration(1000000);
+
+    while (rmw_uros_ping_agent(100, 1) != RCL_RET_OK) { delay(100); }
+
+    allocator = rcl_get_default_allocator();
+    rclc_support_init(&support, 0, NULL, &allocator);
+    rclc_node_init_default(&node, "esp32_robot_node", "", &support);
+
+    rosidl_runtime_c__String__assign(&msg_odom.header.frame_id, "odom");
+    rosidl_runtime_c__String__assign(&msg_odom.child_frame_id, "base_link");
+
+    rclc_subscription_init_default(&subscriber, &node, ROSIDL_GET_MSG_TYPE_SUPPORT(geometry_msgs, msg, Twist), "cmd_vel");
+    rclc_publisher_init_default(&odom_pub, &node, ROSIDL_GET_MSG_TYPE_SUPPORT(nav_msgs, msg, Odometry), "odom");
+    rclc_publisher_init_default(&rpm_l_pub, &node, ROSIDL_GET_MSG_TYPE_SUPPORT(std_msgs, msg, Float32), "real_rpm_l");
+    rclc_publisher_init_default(&rpm_r_pub, &node, ROSIDL_GET_MSG_TYPE_SUPPORT(std_msgs, msg, Float32), "real_rpm_r");
+    rclc_publisher_init_default(&tick_l_pub, &node, ROSIDL_GET_MSG_TYPE_SUPPORT(std_msgs, msg, Int64), "enc_l_ticks");
+    rclc_publisher_init_default(&tick_r_pub, &node, ROSIDL_GET_MSG_TYPE_SUPPORT(std_msgs, msg, Int64), "enc_r_ticks");
+
+    rclc_executor_init(&executor, &support.context, 1, &allocator);
+    rclc_executor_add_subscription(&executor, &subscriber, &msg_cmd_vel, &cmd_vel_callback, ON_NEW_DATA);
+}
+
+void loop() {
+    rclc_executor_spin_some(&executor, RCL_MS_TO_NS(1));
+
+    static unsigned long lastUpdate = 0;
+    if (millis() - lastUpdate > 50) {
+        float dt = (millis() - lastUpdate) / 1000.0;
+        lastUpdate = millis();
+
+        long cL = encoderL; long cR = encoderR;
+        long dL_ticks = cL - lastEncL; long dR_ticks = cR - lastEncR;
+        lastEncL = cL; lastEncR = cR;
+
+        // Publish Ticks
+        msg_tick_l.data = cL; msg_tick_r.data = cR;
+        rcl_publish(&tick_l_pub, &msg_tick_l, NULL);
+        rcl_publish(&tick_r_pub, &msg_tick_r, NULL);
+
+        // RPM & Odom
+        msg_rpm_l.data = ((float)dL_ticks / 2000.0) * (60.0 / dt);
+        msg_rpm_r.data = ((float)dR_ticks / 2000.0) * (60.0 / dt);
+
+        float distL = (float)dL_ticks * METER_PER_TICK;
+        float distR = (float)dR_ticks * METER_PER_TICK;
+
+        float dStep = (distL + distR) / 2.0;
+        float dTheta = (distR - distL) / TRACK_WIDTH;
+
+        pose_x += dStep * cos(pose_theta);
+        pose_y += dStep * sin(pose_theta);
+        pose_theta += dTheta;
+
+        msg_odom.header.stamp.sec = millis() / 1000;
+        msg_odom.header.stamp.nanosec = (millis() % 1000) * 1000000;
+        msg_odom.pose.pose.position.x = pose_x;
+        msg_odom.pose.pose.position.y = pose_y;
+        msg_odom.pose.pose.orientation.z = sin(pose_theta / 2.0);
+        msg_odom.pose.pose.orientation.w = cos(pose_theta / 2.0);
+
+        rcl_publish(&odom_pub, &msg_odom, NULL);
+        rcl_publish(&rpm_l_pub, &msg_rpm_l, NULL);
+        rcl_publish(&rpm_r_pub, &msg_rpm_r, NULL);
+    }
+}
